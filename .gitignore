@@ -1,0 +1,9 @@
+*.o
+*.tmp
+__pycache__/
+.venv/
+.runtime/
+payloads/stream8-injector-*.elf
+edge-*/
+*.bin
+!dist/*.elf

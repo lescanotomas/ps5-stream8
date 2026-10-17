@@ -1,0 +1,275 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Stream8 PS5 Live · v0.4.2</title>
+<style>
+  html,body{margin:0;width:100%;height:100%;background:#000;color:#fff;font:16px system-ui;overflow:hidden}
+  canvas{width:100%;height:100%;object-fit:contain}
+  #status{position:fixed;left:12px;top:12px;padding:8px 11px;border-radius:7px;background:#000b}
+  #telemetry{position:fixed;left:12px;top:54px;padding:7px 10px;border-radius:7px;background:#000b;color:#cbd5e1;font:13px ui-monospace,monospace}
+  #reconnect{position:fixed;left:12px;top:92px;padding:10px 14px;border:0;border-radius:7px;background:#1677ff;color:#fff;font:600 15px system-ui;cursor:pointer}
+  #audio{position:fixed;right:12px;top:12px;padding:10px 14px;border:0;border-radius:7px;background:#1677ff;color:#fff;font:600 15px system-ui;cursor:pointer}
+  #latencyBox{position:fixed;right:12px;top:58px;padding:7px 10px;border-radius:7px;background:#000b;font:13px system-ui}
+  #latency{margin-left:6px;background:#111827;color:#fff;border:1px solid #475569;border-radius:5px;padding:4px}
+</style>
+<canvas id="screen"></canvas><div id="status">Conectando a la PS5…</div><div id="telemetry">Buffer -- · Cola -- · Jitter -- · Drops 0</div><button id="reconnect" hidden>Reconectar video</button><button id="audio">Activar audio</button><label id="latencyBox">Latencia<select id="latency"><option value="60">60 ms</option><option value="80" selected>80 ms</option><option value="120">120 ms</option><option value="200">200 ms</option><option value="400">400 ms</option></select></label>
+<script>
+const screen=document.querySelector('#screen'),ctx=screen.getContext('2d'),status=document.querySelector('#status'),telemetry=document.querySelector('#telemetry'),reconnect=document.querySelector('#reconnect'),audioButton=document.querySelector('#audio'),latencySelect=document.querySelector('#latency');
+let decoder=null,configured=false,started=false,lastFrameAt=0,lastLabel='',configSignature='';
+let audioContext=null,audioDecoder=null,audioEnabled=false,nextAudioAt=0;
+let fpsWindowAt=performance.now(),fpsFrames=0,displayFps=0;
+let inputWindowAt=performance.now(),inputFrames=0,inputFps=0;
+let lastVideoTimelineUs=0,lastAudioTimelineUs=0;
+let bitrateWindowAt=performance.now(),bitrateBytes=0,streamMbps=0;
+let lastVideoArrivalMs=0,arrivalJitterMs=0,droppedFrames=0,queueDrops=0,lateDrops=0,lastTelemetryAt=0,queueOverflowSince=0;
+let chunks=[],buffered=0;
+let renderQueue=[];
+const DEFAULT_PLAYOUT_DELAY_MS=80,FRAME_INTERVAL_MS=1000/60,AUDIO_RESYNC_THRESHOLD_S=.05,QUEUE_MARGIN_MS=50,QUEUE_BURST_GRACE_MS=300;
+const allowedDelays=new Set([60,80,120,200,400]);
+let playoutDelayMs=Number(localStorage.getItem('stream8-playout-delay'));
+if(!allowedDelays.has(playoutDelayMs))playoutDelayMs=DEFAULT_PLAYOUT_DELAY_MS;
+latencySelect.value=String(playoutDelayMs);
+
+latencySelect.onchange=()=>{
+  const selected=Number(latencySelect.value);
+  playoutDelayMs=allowedDelays.has(selected)?selected:DEFAULT_PLAYOUT_DELAY_MS;
+  localStorage.setItem('stream8-playout-delay',String(playoutDelayMs));
+  nextAudioAt=0;
+  trimRenderQueue(performance.now())
+};
+
+function setStatus(text){if(text!==lastLabel){status.textContent=text;lastLabel=text}}
+
+function queueSpanMs(){
+  if(renderQueue.length<2)return 0;
+  return Math.max(0,(renderQueue[renderQueue.length-1].timestamp-renderQueue[0].timestamp)/1000)
+}
+
+function updateTelemetry(force=false){
+  const now=performance.now();
+  if(!force&&now-lastTelemetryAt<250)return;
+  lastTelemetryAt=now;
+  const wait=renderQueue.length?Math.max(0,renderQueue[0].timestamp/1000+playoutDelayMs-now):0;
+  const burst=queueOverflowSince?Math.min(QUEUE_BURST_GRACE_MS,now-queueOverflowSince):0;
+  telemetry.textContent=`Buffer ${playoutDelayMs} ms · Espera ${wait.toFixed(0)} ms · Cola ${renderQueue.length}/${queueSpanMs().toFixed(0)} ms · Ráfaga ${burst.toFixed(0)} ms · Jitter ${arrivalJitterMs.toFixed(1)} ms · Drops ${droppedFrames} (cola ${queueDrops}, tarde ${lateDrops})`
+}
+
+function dropOldestFrame(reason){
+  const frame=renderQueue.shift();
+  if(frame){
+    frame.close();droppedFrames++;
+    if(reason==='queue')queueDrops++;
+    else lateDrops++
+  }
+}
+
+function trimRenderQueue(now){
+  // Give short decoder/network bursts time to drain naturally. Only trim a
+  // queue that remains above the time cap for the full grace interval.
+  const maxQueueMs=playoutDelayMs+QUEUE_MARGIN_MS;
+  const maxLateMs=Math.max(20,Math.min(50,playoutDelayMs/2));
+  if(queueSpanMs()>maxQueueMs){
+    if(!queueOverflowSince)queueOverflowSince=now;
+    if(now-queueOverflowSince>=QUEUE_BURST_GRACE_MS){
+      while(renderQueue.length>1&&queueSpanMs()>maxQueueMs)dropOldestFrame('queue');
+      queueOverflowSince=0
+    }
+  }else queueOverflowSince=0;
+  while(renderQueue.length>1&&renderQueue[0].timestamp/1000+playoutDelayMs<now-maxLateMs)dropOldestFrame('late');
+  updateTelemetry()
+}
+
+function waitForManualReconnect(){
+  reconnect.hidden=false;
+  setStatus('Juego cambiado: reconectá cuando termine de abrir');
+  return new Promise(resolve=>{reconnect.onclick=()=>{reconnect.hidden=true;reconnect.onclick=null;resolve()}})
+}
+
+function clearRenderQueue(){
+  for(const frame of renderQueue)frame.close();
+  renderQueue=[];fpsWindowAt=performance.now();fpsFrames=0;displayFps=0;
+  inputWindowAt=performance.now();inputFrames=0;inputFps=0;
+  lastVideoTimelineUs=0;lastAudioTimelineUs=0;
+  lastVideoArrivalMs=0;arrivalJitterMs=0;droppedFrames=0;queueDrops=0;lateDrops=0;queueOverflowSince=0;
+  bitrateWindowAt=performance.now();bitrateBytes=0;streamMbps=0
+  updateTelemetry(true)
+}
+
+function resetAudioDecoder(){
+  if(audioDecoder&&audioDecoder.state!=='closed'){try{audioDecoder.close()}catch(e){}}
+  nextAudioAt=0;
+  if(!audioEnabled)return;
+  audioDecoder=new AudioDecoder({
+    output:data=>{
+      if(!audioContext||audioContext.state!=='running'){data.close();return}
+      const channels=data.numberOfChannels,frames=data.numberOfFrames;
+      const packetTimestamp=data.timestamp;
+      const buffer=audioContext.createBuffer(channels,frames,data.sampleRate);
+      for(let channel=0;channel<channels;channel++)data.copyTo(buffer.getChannelData(channel),{planeIndex:channel,format:'f32-planar'});
+      data.close();
+      const source=audioContext.createBufferSource();source.buffer=buffer;source.connect(audioContext.destination);
+      const now=audioContext.currentTime;
+      const target=now+Math.max(.02,(packetTimestamp/1000+playoutDelayMs-performance.now())/1000);
+      if(!nextAudioAt||nextAudioAt<now||Math.abs(nextAudioAt-target)>AUDIO_RESYNC_THRESHOLD_S)nextAudioAt=target;
+      const startAt=Math.max(target,nextAudioAt);
+      source.start(startAt);nextAudioAt=startAt+buffer.duration
+    },
+    error:error=>{console.error('Audio:',error);audioDecoder=null;nextAudioAt=0}
+  });
+  audioDecoder.configure({codec:'mp4a.40.2',sampleRate:48000,numberOfChannels:2,description:new Uint8Array([0x11,0x90])})
+}
+
+audioButton.onclick=async()=>{
+  if(!('AudioDecoder'in window)){audioButton.textContent='Audio no compatible';audioButton.disabled=true;return}
+  if(!audioContext)audioContext=new AudioContext({sampleRate:48000});
+  await audioContext.resume();audioEnabled=true;resetAudioDecoder();audioButton.textContent='Audio activo';audioButton.disabled=true
+};
+
+function drawFrame(frame){
+  if(screen.width!==frame.displayWidth||screen.height!==frame.displayHeight){screen.width=frame.displayWidth;screen.height=frame.displayHeight}
+  ctx.drawImage(frame,0,0);frame.close();lastFrameAt=performance.now();fpsFrames++;
+  const elapsed=lastFrameAt-fpsWindowAt;
+  if(elapsed>=1000){displayFps=fpsFrames*1000/elapsed;fpsFrames=0;fpsWindowAt=lastFrameAt}
+  const fps=displayFps?displayFps.toFixed(1):'--';
+  const source=inputFps?inputFps.toFixed(1):'--';
+  const mbps=streamMbps?streamMbps.toFixed(1):'--';
+  setStatus(`${screen.width}×${screen.height} · ${fps} FPS · fuente ${source} · ${mbps} Mbps · EN VIVO`)
+}
+
+function renderLoop(now){
+  trimRenderQueue(now);
+  if(renderQueue.length&&renderQueue[0].timestamp/1000+playoutDelayMs<=now)drawFrame(renderQueue.shift());
+  requestAnimationFrame(renderLoop)
+}
+requestAnimationFrame(renderLoop);
+
+function newDecoder(){
+  if(decoder&&decoder.state!=='closed'){try{decoder.close()}catch(e){}}
+  clearRenderQueue();
+  decoder=new VideoDecoder({
+    output:frame=>{
+      renderQueue.push(frame);
+      trimRenderQueue(performance.now())
+    },
+    // A decoder that reports an error is closed for good: drop it and wait
+    // for the next SPS/PPS to build a fresh one instead of dying silently.
+    error:error=>{configured=false;started=false;configSignature='';clearRenderQueue();setStatus('Decoder reiniciado: '+error.message)}
+  });
+  configured=false;started=false
+}
+newDecoder();
+
+// Take exactly n bytes from the queued chunks without re-copying the rest.
+function take(n){
+  const out=new Uint8Array(n);let filled=0;
+  while(filled<n){
+    const head=chunks[0],need=n-filled;
+    if(head.length<=need){out.set(head,filled);filled+=head.length;chunks.shift()}
+    else{out.set(head.subarray(0,need),filled);chunks[0]=head.subarray(need);filled+=need}
+  }
+  buffered-=n;return out
+}
+function peekLength(){
+  const b=new Uint8Array(5);let got=0;
+  for(const c of chunks){for(let i=0;i<c.length&&got<5;i++)b[got++]=c[i];if(got===5)break}
+  return {type:b[0],length:new DataView(b.buffer).getUint32(1)}
+}
+
+function nals(data){
+  const marks=[];
+  for(let i=0;i+3<data.length;i++)if(data[i]===0&&data[i+1]===0&&(data[i+2]===1||(data[i+2]===0&&data[i+3]===1))){marks.push([i,data[i+2]===1?3:4]);i+=data[i+2]===1?2:3}
+  const out=[];
+  for(let i=0;i<marks.length;i++){const begin=marks[i][0]+marks[i][1],end=i+1<marks.length?marks[i+1][0]:data.length;if(end>begin)out.push(data.subarray(begin,end))}
+  return out
+}
+function avcc(parts){let size=0;for(const n of parts)size+=4+n.length;const out=new Uint8Array(size);let p=0;for(const n of parts){new DataView(out.buffer).setUint32(p,n.length);p+=4;out.set(n,p);p+=n.length}return out}
+function configure(parts){
+  const sps=parts.find(n=>(n[0]&31)===7),pps=parts.find(n=>(n[0]&31)===8);if(!sps||!pps)return false;
+  // Encoders commonly repeat SPS/PPS alongside every periodic IDR. Resetting
+  // WebCodecs for an identical configuration caused a visible hitch at each
+  // GOP boundary, so only reconfigure when the bytes actually change.
+  const signature=Array.from(sps).join(',')+'|'+Array.from(pps).join(',');
+  if(configured&&decoder&&decoder.state==='configured'&&signature===configSignature)return true;
+  clearRenderQueue();
+  const desc=new Uint8Array(11+sps.length+pps.length);let p=0;desc[p++]=1;desc[p++]=sps[1];desc[p++]=sps[2];desc[p++]=sps[3];desc[p++]=255;desc[p++]=225;desc[p++]=sps.length>>8;desc[p++]=sps.length;desc.set(sps,p);p+=sps.length;desc[p++]=1;desc[p++]=pps.length>>8;desc[p++]=pps.length;desc.set(pps,p);
+  const codec='avc1.'+[sps[1],sps[2],sps[3]].map(x=>x.toString(16).padStart(2,'0')).join('');
+  if(!decoder||decoder.state==='closed')newDecoder();
+  else if(decoder.state==='configured')decoder.reset();
+  decoder.configure({codec,description:desc,optimizeForLatency:true,hardwareAcceleration:'prefer-hardware'});
+  configSignature=signature;configured=true;started=false;setStatus('Esperando fotograma clave…');return true
+}
+
+// If the PS5 stops sending frames (title change), say so instead of freezing.
+setInterval(()=>{if(lastFrameAt&&performance.now()-lastFrameAt>2500)setStatus('Esperando video del juego…')},500);
+
+function handlePacket(packet){
+  const parts=nals(packet);
+  configure(parts);
+  if(!configured||decoder.state!=='configured')return false;
+  // Decode only VCL NALs. If an IDR arrives in the same packet as SPS/PPS,
+  // keep it instead of dropping the keyframe after configuration.
+  const videoParts=parts.filter(n=>{const type=n[0]&31;return type===1||type===5});
+  if(!videoParts.length)return false;
+  const key=videoParts.some(n=>(n[0]&31)===5);
+  if(!started&&!key)return false;
+  if(key)started=true;
+  const now=performance.now();inputFrames++;
+  if(lastVideoArrivalMs){
+    const deviation=Math.abs((now-lastVideoArrivalMs)-FRAME_INTERVAL_MS);
+    arrivalJitterMs+=.1*(deviation-arrivalJitterMs)
+  }
+  lastVideoArrivalMs=now;
+  const inputElapsed=now-inputWindowAt;
+  if(inputElapsed>=1000){inputFps=inputFrames*1000/inputElapsed;inputFrames=0;inputWindowAt=now}
+  const arrivedAt=Math.round(now*1000);
+  // TCP can deliver several frames in one chunk. Keep their 60 Hz cadence
+  // instead of assigning the same time and collapsing them into one frame.
+  lastVideoTimelineUs=Math.max(arrivedAt,lastVideoTimelineUs+16667);
+  decoder.decode(new EncodedVideoChunk({type:key?'key':'delta',timestamp:lastVideoTimelineUs,data:avcc(videoParts)}));
+  return true
+}
+
+function handleAudio(packet){
+  if(!audioEnabled)return;
+  if(!audioDecoder||audioDecoder.state==='closed')resetAudioDecoder();
+  if(!audioDecoder||audioDecoder.state!=='configured')return;
+  const arrivedAt=Math.round(performance.now()*1000);
+  lastAudioTimelineUs=Math.max(arrivedAt,lastAudioTimelineUs+21333);
+  audioDecoder.decode(new EncodedAudioChunk({type:'key',timestamp:lastAudioTimelineUs,data:packet}))
+}
+
+const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+async function streamForever(){
+  let manualReconnectRequired=false;
+  for(;;){
+    chunks=[];buffered=0;
+    let sessionHadVideo=false;
+    try{
+      resetAudioDecoder();
+      const response=await fetch('/stream-av',{cache:'no-store'});
+      if(!response.ok)throw new Error('HTTP '+response.status);
+      setStatus('Esperando video del juego…');
+      const reader=response.body.getReader();
+      for(;;){
+        const read=await reader.read();if(read.done)throw new Error('stream closed');
+        bitrateBytes+=read.value.length;
+        const bitrateNow=performance.now(),bitrateElapsed=bitrateNow-bitrateWindowAt;
+        if(bitrateElapsed>=1000){streamMbps=bitrateBytes*8/bitrateElapsed/1000;bitrateBytes=0;bitrateWindowAt=bitrateNow}
+        chunks.push(read.value);buffered+=read.value.length;
+        while(buffered>=5){
+          const header=peekLength();if(buffered<5+header.length)break;
+          take(5);const packet=take(header.length);
+          if((header.type===0||header.type===1)&&handlePacket(packet)){sessionHadVideo=true;manualReconnectRequired=false}
+          else if(header.type===2)handleAudio(packet)
+        }
+      }
+    }catch(error){
+      configured=false;started=false;configSignature='';
+      clearRenderQueue();
+      if(sessionHadVideo||manualReconnectRequired){manualReconnectRequired=true;await waitForManualReconnect()}
+      else{setStatus('Reconectando video…');await sleep(3000)}
+    }
+  }
+}
+streamForever();
+updateTelemetry(true);
+</script>

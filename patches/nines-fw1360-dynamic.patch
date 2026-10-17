@@ -1,0 +1,162 @@
+diff --git a/src/main.c b/src/main.c
+index e5b0b4c..8f1f314 100755
+--- a/src/main.c
++++ b/src/main.c
+@@ -1,5 +1,8 @@
+ #include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
+ #include <sys/types.h>
++#include <sys/sysctl.h>
+ #include <unistd.h>
+ #include <elf.h>
+ #include <signal.h>
+@@ -16,8 +19,13 @@
+ 
+ #define DUMP_SIZE 0x100
+ #define MAX_PROC_NAME 0x100
+-#define PORT 9033
+-#define THREAD_NAME "injector.elf"
++#ifndef STREAM8_INJECTOR_PORT
++#define STREAM8_INJECTOR_PORT 9041
++#endif
++#define THREAD_NAME "stream8-injector"
++#define KINFO_PID_OFFSET 72
++#define KINFO_COMM_OFFSET 447
++#define KINFO_COMM_SIZE 20
+ 
+ typedef struct __injector_data_t
+ {
+@@ -32,6 +40,44 @@ typedef struct __injector_data_t
+ 	uint32_t elf_magic = 0x7f454c46;
+ #endif 
+ 
++static pid_t find_pid_by_name(const char* proc_name)
++{
++    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PROC, 0};
++    size_t size = 0;
++    pid_t result = -1;
++
++    if (sysctl(mib, 4, NULL, &size, NULL, 0) || !size)
++        return -1;
++
++    char* buffer = malloc(size);
++    if (!buffer)
++        return -1;
++
++    if (!sysctl(mib, 4, buffer, &size, NULL, 0))
++    {
++        for (char* cursor = buffer; cursor < buffer + size;)
++        {
++            int struct_size = 0;
++            pid_t pid = -1;
++            memcpy(&struct_size, cursor, sizeof(struct_size));
++            if (struct_size <= KINFO_COMM_OFFSET ||
++                cursor + struct_size > buffer + size)
++                break;
++            memcpy(&pid, cursor + KINFO_PID_OFFSET, sizeof(pid));
++            if (!strncmp(cursor + KINFO_COMM_OFFSET, proc_name,
++                         KINFO_COMM_SIZE))
++            {
++                result = pid;
++                break;
++            }
++            cursor += struct_size;
++        }
++    }
++
++    free(buffer);
++    return result;
++}
++
+ 
+ //
+ // Callback used for every requested injection
+@@ -49,7 +95,18 @@ void inject(int incoming_fd, void* data, ssize_t data_size)
+     
+     printf("Injecting on %s...\n", injection_data->proc_name);
+ 
+-    struct proc* target_proc = find_proc_by_name(injection_data->proc_name);
++    pid_t target_pid = find_pid_by_name(injection_data->proc_name);
++    struct proc* target_proc = NULL;
++    if (target_pid >= 0)
++    {
++        target_proc = calloc(1, sizeof(*target_proc));
++        if (target_proc)
++        {
++            target_proc->pid = target_pid;
++            strncpy(target_proc->p_comm, injection_data->proc_name,
++                    sizeof(target_proc->p_comm) - 1);
++        }
++    }
+ 
+     if (target_proc)
+     {
+@@ -59,29 +116,21 @@ void inject(int incoming_fd, void* data, ssize_t data_size)
+         }
+ 
+         free(target_proc);
++    } else {
++        notify_send("Unable to find process %s", injection_data->proc_name);
+     }
+ }
+ 
+ 
+ int main(int argc, char const *argv[])
+ {
+-    struct proc* existing_instance = find_proc_by_name(THREAD_NAME);
+-    
+-    if (existing_instance)
+-    {
+-        if (kill(existing_instance->pid, SIGKILL))
+-        {
+-            printf("Unable to kill %d\n", existing_instance->pid);
+-            return 1;
+-        }
+-    }
+-
+     syscall(SYS_thr_set_name, -1, THREAD_NAME);
+-    notify_send("Starting injector on %d...", PORT);
++    notify_send("Starting Stream8 injector on %d...", STREAM8_INJECTOR_PORT);
+ 
+-    if (start_server(PORT, inject) <= 0)
++    if (start_server(STREAM8_INJECTOR_PORT, inject) <= 0)
+     {
+-        notify_send("Unable to initialize injector server on port %d! Aborting...", PORT);
++        notify_send("Unable to initialize injector server on port %d! Aborting...",
++                    STREAM8_INJECTOR_PORT);
+         return 1;
+     }
+ 
+diff --git a/src/ucred.c b/src/ucred.c
+index 5460fb5..f46f770 100755
+--- a/src/ucred.c
++++ b/src/ucred.c
+@@ -7,26 +7,7 @@
+ //
+ void set_ucred_to_debugger()
+ {
+-    struct proc* proc = get_proc_by_pid(getpid());
+-
+-    if (proc)
+-    {
+-        //
+-        // Parse process ucred
+-        //
+-        struct ucred ucred;
+-        bzero(&ucred, sizeof(struct ucred));
+-        //
+-        // Read from kernel
+-        //
+-        uintptr_t authid = 0;
+-        uintptr_t ptrace_authid = PTRACE_AUTHID;
+-        kernel_copyout((uintptr_t) proc->p_ucred + 0x58, &authid, sizeof(uintptr_t));
+-
+-        kernel_copyin(&ptrace_authid, (uintptr_t) proc->p_ucred + 0x58, sizeof(uintptr_t));
+-
+-        free(proc);
+-    }
++    kernel_set_ucred_authid(getpid(), PTRACE_AUTHID);
+ }
+ 
+ struct proc_creds* jailbreak_process(pid_t pid)
